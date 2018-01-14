@@ -2,7 +2,7 @@
 """exhibitor2dns: Dynamic DNS for Exhibitor-run Zookeeper ensembles."""
 
 import argparse
-import boto
+import boto3
 import logging
 import requests
 
@@ -34,15 +34,17 @@ def parse_args():
 def get_zk_servers(exhibitor_url):
     """Query Exhibitor's REST api and get the current list of servers."""
     url = ''.join([exhibitor_url.rstrip('/'), '/exhibitor/v1/cluster/list'])
-    return requests.get(url).json()['servers']
+    return sorted(requests.get(url).json()['servers'])
 
 
 def main():
     """main"""
     args = parse_args()
     logging.basicConfig(level=args.verbosity)
-    r53 = boto.connect_route53()
-    zone = r53.get_zone(args.zone)
+
+    client = boto3.client('route53')
+    zone = client.list_hosted_zones_by_name(DNSName=args.zone)
+    hosted_zone_id = zone.get('HostedZones')[0].get('Id')
 
     if args.rr[-1] == '.':
         target_fqdn = args.rr
@@ -54,19 +56,81 @@ def main():
     exhibitor_list = get_zk_servers(args.exhibitor_url)
     logging.info('Exhibitor cluster: %s', exhibitor_list)
 
-    existing_record = zone.get_a(target_fqdn)
+    existing_record = fetch_existing_resource_records(client, hosted_zone_id, target_fqdn)
 
     if existing_record:
-        logging.info('Existing record: %s', existing_record.resource_records)
-        if sorted(exhibitor_list) != sorted(existing_record.resource_records):
+        logging.info('Existing record: %s', existing_record)
+        if sorted(exhibitor_list) != sorted(existing_record):
             logging.info('Updating record to match')
-            zone.update_record(existing_record, exhibitor_list)
+            upsert_record(client, hosted_zone_id, target_fqdn, exhibitor_list, args.ttl)
         else:
             logging.info('Up to date.')
     else:
         logging.info('Creating new record.')
-        zone.add_a(target_fqdn, exhibitor_list, ttl=args.ttl)
+        upsert_record(client, hosted_zone_id, target_fqdn, exhibitor_list, args.ttl)
+
+    for i, zkserver_ip in enumerate(sorted(exhibitor_list)):
+        idx = i + 1
+        target_fqdn = "zk%02d.%s." % (idx, args.zone)
+        logging.info("target_fqdn: %s ip: %s" % (target_fqdn, zkserver_ip))
+
+        ip_list = [zkserver_ip]
+        existing_record = fetch_existing_resource_records(client, hosted_zone_id, target_fqdn)
+
+        if existing_record:
+            logging.info('Existing record: %s', existing_record)
+            if sorted(ip_list) != sorted(existing_record):
+                logging.info('Updating record to match')
+                upsert_record(client, hosted_zone_id, target_fqdn, ip_list, args.ttl)
+            else:
+                logging.info('Up to date.')
+        else:
+            logging.info('Creating new record: %s' % target_fqdn)
+            upsert_record(client, hosted_zone_id, target_fqdn, ip_list, args.ttl)
+
     logging.info('Done!')
+
+
+def upsert_record(client, hosted_zone_id, target_fqdn, ip_list, ttl):
+    try:
+        resource_records = []
+        for value in ip_list:
+            resource_records.append({'Value': value})
+
+        if resource_records:
+            client.change_resource_record_sets(
+                HostedZoneId=hosted_zone_id,
+                ChangeBatch={
+                    'Changes': [{
+                        'Action': 'UPSERT',
+                        'ResourceRecordSet': {
+                            'Name': target_fqdn,
+                            'Type': 'A',
+                            'TTL': ttl,
+                            'ResourceRecords': resource_records
+                        }
+                    }]
+                }
+            )
+    except Exception as e:
+        logging.exception(e)
+
+
+def fetch_existing_resource_records(client, hosted_zone_id, target_fqdn):
+    res = client.list_resource_record_sets(HostedZoneId=hosted_zone_id, StartRecordName=target_fqdn, StartRecordType='A')
+
+    resource_records = []
+    for record_set in res.get('ResourceRecordSets', []):
+        record_set_name = record_set.get('Name', '')
+        if(record_set_name != target_fqdn):
+            continue
+
+        for record in record_set.get('ResourceRecords', []):
+            value = record.get('Value')
+            if value is not None:
+                resource_records.append(value)
+
+    return sorted(resource_records)
 
 
 if __name__ == '__main__':
